@@ -1,101 +1,102 @@
 # MLB Win Predictor
 
-Predicts the probability of each MLB team winning their upcoming games using
-live data from the **free MLB Stats API** (no API key required).
+I built this to predict which MLB team is more likely to win any given game using real, live data. It pulls directly from the MLB Stats API (totally free, no API key needed), trains on 4 years of historical games, and cross-references its predictions against dRatings.com to give you a more reliable final answer.
 
-Trained on the full 2025 regular season (~2,430 games) and updated with
-current 2026 season stats as they accumulate.
+## What it does
 
-## How it works
+- Pulls team stats, standings, and game results from the MLB Stats API
+- Builds Elo ratings from 4 seasons of game data (same approach FiveThirtyEight used)
+- Trains on ~9,700 games (2022–2025) using starting pitcher stats, Pythagorean win%, OPS, ERA, WHIP, and more
+- Grabs the current week's schedule and runs win probability predictions
+- Scrapes dRatings.com and compares their numbers against the model — flags where they agree (high confidence) and where they split (bet with caution)
 
-1. **`fetch_data.py`** — pulls completed game results + team batting/pitching
-   stats from `statsapi.mlb.com` and builds a training CSV.
-2. **`train.py`** — trains a calibrated XGBoost classifier on team stat
-   differentials (win%, OPS, ERA, WHIP, last-10 form, run differential, etc.)
-   and compares against Logistic Regression baseline.
-3. **`predict.py`** — fetches this week's schedule, grabs current 2026 season
-   stats for each team, and outputs win probabilities in a formatted table.
+## Files
 
-## Features used
+| File | What it does |
+|------|-------------|
+| `fetch_data.py` | Pulls game results + team/pitcher stats from the MLB API, builds training CSVs |
+| `elo.py` | Computes Elo ratings for all 30 teams across 2022–2025 |
+| `train.py` | Trains and compares Logistic Regression, XGBoost, and LightGBM — picks the best one |
+| `roster_stats.py` | Builds 2026 team projections using current rosters + 2025 player stats |
+| `external_odds.py` | Scrapes dRatings.com and runs the ensemble comparison |
+| `predict.py` | Puts everything together — run this to get predictions |
 
-| Category | Features |
-|----------|----------|
-| Win rate | Win%, home win%, away win%, last-10 win%, run differential |
-| Batting  | OPS, runs/game, HR/game (differentials) |
-| Pitching | ERA, WHIP, K/9 (differentials) |
-
-## Quickstart
+## How to run it
 
 ```bash
-# 1. Clone & set up environment
 git clone https://github.com/LevinMathew1/mlb-win-predictor.git
 cd mlb-win-predictor
+
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-# 2. Fetch 2025 season training data (~20 seconds)
-python fetch_data.py
+# Grab 4 seasons of training data
+python fetch_data.py --seasons 2022 2023 2024 2025
 
-# 3. Train the model
-python train.py
+# Train the model
+python train.py --seasons 2022 2023 2024 2025
 
-# 4. Predict this week's games (auto-fetches live 2026 data)
+# Run predictions (pulls live schedule + dRatings comparison automatically)
 python predict.py
 ```
 
-`predict.py` will **auto-run steps 2 and 3** if no model is found, so you can
-also just run `python predict.py` directly.
+Just want predictions without retraining? Running `predict.py` directly will auto-fetch and train if no model exists.
 
 ## Options
 
 ```bash
-# Predict next 14 days
+# Predict the next 14 days
 python predict.py --days 14
 
-# Predict from a specific date
+# Start from a specific date
 python predict.py --date 2026-04-10
 
-# Train on a different season
-python fetch_data.py --season 2024
-python train.py --data data/mlb_games_2024.csv
+# Skip the dRatings scrape, show our model only
+python predict.py --no-external
+
+# Retrain on a single season
+python fetch_data.py --season 2025
+python train.py --seasons 2025
 ```
 
-## Example output
+## How predictions work
 
-```
-===========================================================================
-  MLB WIN PROBABILITY PREDICTIONS
-  Model: XGBoost  |  CV AUC: 0.621  |  Home win rate: 54.1%
-===========================================================================
+The model pulls 2026 rosters, maps each player to their 2025 individual stats, and builds projected team batting/pitching lines. It then applies a 30% regression toward the league average — so outlier seasons don't inflate predictions. Elo ratings handle the dynamic team strength piece.
 
-  Thursday, April 03 2026
-  Away Team                    Home Team                    Away%  Home%  Result
-  ---------------------------- ---------------------------- ------ ------  ------
-  New York Yankees             Boston Red Sox               41.2%  58.8%  Scheduled
-  Los Angeles Dodgers          San Francisco Giants         55.3%  44.7%  Scheduled
-  Houston Astros               Texas Rangers                48.1%  51.9%  Scheduled
-```
+For each game it outputs:
 
-## Model performance (2025 season, 5-fold CV)
+- **Ours** — our model's home team win probability
+- **dRate** — dRatings.com's probability (when available)
+- **FINAL** — ensemble average of both
+- **Signal** — STRONG (both agree, big margin), LEAN (both agree, close), or SPLIT (they disagree — proceed with caution)
 
-| Metric | XGBoost | Logistic Regression |
-|--------|---------|---------------------|
-| AUC    | ~0.62   | ~0.60               |
-| Log-Loss | ~0.68 | ~0.69               |
+## Model performance (2022–2025, 5-fold CV)
 
-> **Note:** MLB is notoriously hard to predict — even Vegas lines rarely exceed
-> 0.65 AUC. A ~0.62 AUC reflects genuine predictive signal, not a bug.
+| Model | AUC | Log-Loss |
+|-------|-----|---------|
+| Baseline (always pick home) | 0.500 | — |
+| Elo only | 0.585 | 0.680 |
+| Logistic Regression (full features) | **0.639** | **0.661** |
+| LightGBM | 0.612 | 0.673 |
+| XGBoost | 0.612 | 0.673 |
 
-## Limitations & future improvements
+For context, Vegas sportsbooks typically sit around 0.62–0.66 AUC on MLB games. Baseball is genuinely hard to predict — even the best teams only win about 60% of their games.
 
-- **Small-sample early season**: predictions are less reliable in April when
-  teams have played fewer games. Stats stabilize by late May.
-- **No starting pitcher data**: adding that day's starter ERA would
-  significantly improve accuracy.
-- **No data leakage guard**: training uses full-season stats, not
-  rolling/in-game stats. A proper implementation would use stats accumulated
-  only up to each game's date.
+## Features the model uses
+
+- Win% differential, home/away splits, last-10 form, run differential
+- Pythagorean win% (strips out luck from the raw win%)
+- OPS, runs per game, HR per game
+- Team ERA, WHIP, K/9
+- Starting pitcher ERA, FIP, WHIP, K/9 (home and away)
+- Elo rating differential
+
+## Known limitations
+
+- Early in the season (April), stats are based on small samples so predictions are wider. Things tighten up by late May.
+- Starting pitcher stats are season-level averages, not the actual guy taking the mound that day. That would require day-of lineup data.
+- dRatings only posts games close to game time, so for future dates you'll see "OUR MODEL ONLY" — that's expected.
 
 ## License
 

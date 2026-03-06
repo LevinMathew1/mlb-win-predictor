@@ -1,11 +1,10 @@
 """
-Build 2026 team stat projections from current rosters + 2025 individual player stats.
+Builds projected team stats for 2026 based on who's actually on each roster
+right now — not last year's team as a whole. Pulls every team's current 40-man
+roster, maps each player to their 2025 stats, and aggregates it all into
+team-level batting and pitching lines.
 
-Instead of using 2025 team-level stats (which reflect last year's roster),
-this module:
-  1. Fetches each team's 2026 40-man roster
-  2. Pulls every player's 2025 individual stats in two bulk API calls
-  3. Aggregates counting stats to produce projected team batting/pitching lines
+This way trades, free agent signings, and departures are all accounted for.
 
 Usage:
     from roster_stats import build_roster_projections

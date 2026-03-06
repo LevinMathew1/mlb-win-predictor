@@ -1,12 +1,13 @@
 """
-Fetch this week's MLB schedule and predict win probabilities.
-
-Automatically trains the model if no saved model is found.
+Main prediction script. Grabs the upcoming MLB schedule, runs win
+probability predictions, then cross-references against dRatings.com
+and outputs an ensemble with signal strength for each game.
 
 Usage:
-    python predict.py                    # predictions for the next 7 days
-    python predict.py --days 14          # next 14 days
-    python predict.py --date 2026-04-05  # start from a specific date
+    python predict.py                    # next 7 days
+    python predict.py --days 14
+    python predict.py --date 2026-04-05
+    python predict.py --no-external      # skip dRatings, show our model only
 """
 
 import argparse
@@ -49,17 +50,17 @@ def load_model():
 
 
 def fetch_week_schedule(start_date: str, days: int = 7) -> list[dict]:
-    """Return scheduled/live/final games in the date window."""
+    """Return scheduled/live/final games in the date window, including probable starter IDs."""
     end = (datetime.strptime(start_date, "%Y-%m-%d") + timedelta(days=days - 1)).strftime("%Y-%m-%d")
     data = get("schedule", {
         "sportId": 1,
         "gameType": "R",
         "startDate": start_date,
         "endDate": end,
-        "hydrate": "linescore",
+        "hydrate": "linescore,probablePitcher",
         "fields": (
             "dates,date,games,gamePk,status,statusCode,abstractGameState,"
-            "teams,home,away,team,id,name,isWinner,score"
+            "teams,home,away,team,id,name,isWinner,score,probablePitcher"
         ),
     })
 
@@ -70,42 +71,84 @@ def fetch_week_schedule(start_date: str, days: int = 7) -> list[dict]:
             away = game["teams"]["away"]
             status = game.get("status", {})
             games.append({
-                "game_pk":      game["gamePk"],
-                "date":         date_entry["date"],
-                "state":        status.get("abstractGameState", "Preview"),
-                "status_code":  status.get("statusCode", ""),
-                "home_team_id": home["team"]["id"],
-                "home_team":    home["team"]["name"],
-                "away_team_id": away["team"]["id"],
-                "away_team":    away["team"]["name"],
-                "home_score":   home.get("score"),
-                "away_score":   away.get("score"),
-                "home_won":     home.get("isWinner"),
+                "game_pk":         game["gamePk"],
+                "date":            date_entry["date"],
+                "state":           status.get("abstractGameState", "Preview"),
+                "status_code":     status.get("statusCode", ""),
+                "home_team_id":    home["team"]["id"],
+                "home_team":       home["team"]["name"],
+                "away_team_id":    away["team"]["id"],
+                "away_team":       away["team"]["name"],
+                "home_score":      home.get("score"),
+                "away_score":      away.get("score"),
+                "home_won":        home.get("isWinner"),
+                "home_pitcher_id": home.get("probablePitcher", {}).get("id"),
+                "away_pitcher_id": away.get("probablePitcher", {}).get("id"),
             })
     return games
 
 
-def fetch_current_team_stats(team_ids: list[int]) -> dict:
+# League averages used for regression-to-mean shrinkage
+_LEAGUE_AVG = {
+    "bat_avg": 0.248, "bat_obp": 0.317, "bat_slg": 0.401, "bat_ops": 0.718,
+    "runs_per_game": 4.60, "hr_per_game": 1.05, "k_per_game": 8.80,
+    "era": 4.20, "whip": 1.28, "k9": 8.90, "runs_allowed_per_game": 4.60,
+}
+_REGRESSION_FACTOR = 0.30  # blend 30% toward league average
+
+
+def _regress_to_mean(team_stats: dict) -> dict:
     """
-    Build team stat projections from 2026 rosters + 2025 individual player stats.
-    This accounts for offseason trades, free agent signings, and roster changes.
+    Shrink each team's stats 30% toward the league average.
+    Prevents extreme predictions caused by small-sample or outlier seasons.
+    This is standard in sports analytics (Marcel projections, PECOTA, etc.).
+    """
+    regressed = {}
+    for tid, stats in team_stats.items():
+        new_stats = dict(stats)
+        for key, lg_avg in _LEAGUE_AVG.items():
+            if key in stats:
+                new_stats[key] = (1 - _REGRESSION_FACTOR) * stats[key] + _REGRESSION_FACTOR * lg_avg
+        regressed[tid] = new_stats
+    return regressed
+
+
+def fetch_current_team_stats(team_ids: list[int]) -> tuple:
+    """
+    Build team stat projections from 2026 rosters + 2025 individual player stats,
+    with regression-to-mean shrinkage to prevent overconfident predictions.
     """
     from roster_stats import build_roster_projections
+    from fetch_data import fetch_all_player_pitching_stats
+
     print("Building roster-aware projections (2026 rosters + 2025 player stats)...")
     team_stats, standings = build_roster_projections(
         roster_season=2026, stats_season=2025, verbose=True
     )
-    return team_stats, standings
+    print("Applying 30% regression-to-mean shrinkage...")
+    team_stats = _regress_to_mean(team_stats)
+
+    print("Fetching 2025 player pitching stats for probable starter lookup...")
+    player_pitching = fetch_all_player_pitching_stats(2025)
+    return team_stats, standings, player_pitching
 
 
 def build_features_for_game(htid: int, atid: int,
-                              team_stats: dict, standings: dict) -> dict:
-    from fetch_data import build_features
+                              team_stats: dict, standings: dict,
+                              home_pitcher_id: int = None,
+                              away_pitcher_id: int = None,
+                              player_pitching: dict = None) -> dict:
+    from fetch_data import build_features, pitcher_features
     hs  = team_stats.get(htid, {})
     as_ = team_stats.get(atid, {})
     hst = standings.get(htid, {})
     ast = standings.get(atid, {})
-    return build_features(hs, as_, hst, ast)
+
+    pp = player_pitching or {}
+    home_sp = pitcher_features(pp.get(home_pitcher_id)) if home_pitcher_id else None
+    away_sp = pitcher_features(pp.get(away_pitcher_id)) if away_pitcher_id else None
+
+    return build_features(hs, as_, hst, ast, home_sp=home_sp, away_sp=away_sp)
 
 
 def print_predictions(results: list[dict], metadata: dict) -> None:
@@ -162,8 +205,24 @@ def predict(start_date: str = None, days: int = 7) -> None:
 
     print(f"Found {len(games)} games. Fetching current team stats...")
     all_team_ids = list({g["home_team_id"] for g in games} | {g["away_team_id"] for g in games})
-    team_stats, standings = fetch_current_team_stats(all_team_ids)
+    team_stats, standings, player_pitching = fetch_current_team_stats(all_team_ids)
     time.sleep(0.3)
+
+    # Load Elo ratings for dynamic team-strength feature
+    elo_ratings = {}
+    elo_path = "models/elo_ratings.json"
+    if os.path.exists(elo_path):
+        with open(elo_path) as f:
+            elo_ratings = json.load(f)
+    else:
+        print("  Building Elo ratings (first run)...")
+        from elo import build_elo_ratings
+        elo_ratings, _ = build_elo_ratings()
+
+    from elo import elo_win_prob
+
+    sp_found = sum(1 for g in games if g.get("home_pitcher_id") or g.get("away_pitcher_id"))
+    print(f"  Probable starters announced for {sp_found}/{len(games)} games.")
 
     results = []
     skipped = 0
@@ -173,7 +232,21 @@ def predict(start_date: str = None, days: int = 7) -> None:
             skipped += 1
             continue
 
-        features = build_features_for_game(htid, atid, team_stats, standings)
+        features = build_features_for_game(
+            htid, atid, team_stats, standings,
+            home_pitcher_id=g.get("home_pitcher_id"),
+            away_pitcher_id=g.get("away_pitcher_id"),
+            player_pitching=player_pitching,
+        )
+
+        # Add Elo features
+        home_name = g["home_team"]
+        away_name = g["away_team"]
+        home_elo  = elo_ratings.get(home_name, 1500.0)
+        away_elo  = elo_ratings.get(away_name, 1500.0)
+        features["elo_diff"]      = home_elo - away_elo
+        features["elo_home_prob"] = elo_win_prob(home_elo, away_elo)
+
         X = [[features.get(col, 0) for col in feature_cols]]
 
         probs = model.predict_proba(X)[0]  # [prob_away_win, prob_home_win]
@@ -192,7 +265,22 @@ def predict(start_date: str = None, days: int = 7) -> None:
 
     # Sort by date then game_pk
     results.sort(key=lambda x: (x["date"], x["game_pk"]))
-    print_predictions(results, metadata)
+
+    # --- Fetch dRatings and build ensemble ---
+    print("Fetching dRatings.com predictions for comparison...")
+    from external_odds import fetch_dratings, build_comparison_table, print_comparison
+    dratings = fetch_dratings()
+
+    if dratings:
+        matched = sum(1 for g in results
+                      if (g["away_team"].lower(), g["home_team"].lower()) in
+                      {(d["away_team"].lower(), d["home_team"].lower()) for d in dratings})
+        print(f"  Matched {matched}/{len(results)} games with dRatings data.")
+        combined = build_comparison_table(results, dratings)
+        print_comparison(combined, metadata)
+    else:
+        print("  dRatings unavailable — showing our model only.")
+        print_predictions(results, metadata)
 
 
 if __name__ == "__main__":
@@ -201,5 +289,7 @@ if __name__ == "__main__":
                         help="Start date YYYY-MM-DD (default: today)")
     parser.add_argument("--days", type=int, default=7,
                         help="Number of days to look ahead (default: 7)")
+    parser.add_argument("--no-external", action="store_true",
+                        help="Skip dRatings scraping, show our model only")
     args = parser.parse_args()
     predict(start_date=args.date, days=args.days)
