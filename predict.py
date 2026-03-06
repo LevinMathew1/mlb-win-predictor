@@ -87,29 +87,14 @@ def fetch_week_schedule(start_date: str, days: int = 7) -> list[dict]:
 
 def fetch_current_team_stats(team_ids: list[int]) -> dict:
     """
-    Fetch current-season stats. If the 2026 season hasn't started yet
-    (no stats available), fall back to the 2025 season.
+    Build team stat projections from 2026 rosters + 2025 individual player stats.
+    This accounts for offseason trades, free agent signings, and roster changes.
     """
-    from fetch_data import (fetch_standings, fetch_team_batting_stats,
-                             fetch_team_pitching_stats)
-
-    for season in [2026, 2025]:
-        try:
-            batting  = fetch_team_batting_stats(season)
-            pitching = fetch_team_pitching_stats(season)
-            standings = fetch_standings(season)
-            if batting:
-                print(f"Using {season} season stats for predictions.")
-                break
-        except Exception:
-            continue
-    else:
-        raise RuntimeError("Could not fetch team stats for 2025 or 2026.")
-
-    team_stats = {}
-    for tid, b in batting.items():
-        team_stats[tid] = {**b, **pitching.get(tid, {})}
-
+    from roster_stats import build_roster_projections
+    print("Building roster-aware projections (2026 rosters + 2025 player stats)...")
+    team_stats, standings = build_roster_projections(
+        roster_season=2026, stats_season=2025, verbose=True
+    )
     return team_stats, standings
 
 
